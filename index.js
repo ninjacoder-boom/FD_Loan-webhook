@@ -8,10 +8,10 @@ app.use(express.json({ limit: "1mb" }));
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN || "myWebhookToken123";
 
 const SFMC = {
-  clientId:    process.env.SFMC_CLIENT_ID,
+  clientId: process.env.SFMC_CLIENT_ID,
   clientSecret: process.env.SFMC_CLIENT_SECRET,
-  subdomain:   process.env.SFMC_SUBDOMAIN,
-  deKey:       process.env.SFMC_DE_KEY || "FD_Loan_DE"
+  subdomain: process.env.SFMC_SUBDOMAIN,
+  deKey: process.env.SFMC_DE_KEY || "FD_Loan_DE"
 };
 
 // ─── Token cache ──────────────────────────────────────────────────────────────
@@ -24,13 +24,13 @@ async function getSFMCToken() {
   const response = await axios.post(
     `https://${SFMC.subdomain}.auth.marketingcloudapis.com/v2/token`,
     {
-      grant_type:    "client_credentials",
-      client_id:     SFMC.clientId,
+      grant_type: "client_credentials",
+      client_id: SFMC.clientId,
       client_secret: SFMC.clientSecret
     }
   );
 
-  tokenCache.value     = response.data.access_token;
+  tokenCache.value = response.data.access_token;
   tokenCache.expiresAt = now + response.data.expires_in * 1000;
   console.log("[INFO] New SFMC token fetched");
   return tokenCache.value;
@@ -43,12 +43,14 @@ async function saveToFDLoanDE({ name, phoneNumber, product, createdDate, locale 
 
     const payload = [
       {
-        keys: { PhoneNumber: phoneNumber },
+        keys: {
+          PhoneNumber: phoneNumber,
+          Product: product        // ← added as primary key
+        },
         values: {
-          Name:        name        || "",
-          Product:     product,               // "FD" or "Loan"
+          Name: name || "",
           CreatedDate: createdDate || "",
-          Local:       locale      || ""
+          Local: locale || ""
         }
       }
     ];
@@ -68,8 +70,8 @@ async function saveToFDLoanDE({ name, phoneNumber, product, createdDate, locale 
 
 // ─── Webhook verify ───────────────────────────────────────────────────────────
 app.get("/webhook", (req, res) => {
-  const mode      = req.query["hub.mode"];
-  const token     = req.query["hub.verify_token"];
+  const mode = req.query["hub.mode"];
+  const token = req.query["hub.verify_token"];
   const challenge = req.query["hub.challenge"];
 
   if (mode === "subscribe" && token === VERIFY_TOKEN) {
@@ -97,21 +99,21 @@ app.post("/webhook", async (req, res) => {
           // Only handle text messages
           if (message.type !== "text") continue;
 
-          const text        = message.text?.body || "";
-          const upperText   = text.toUpperCase();
+          const text = message.text?.body || "";
+          const upperText = text.toUpperCase();
 
           // ── Check if message contains FD or Loan ─────────────────────────
-          const hasFD   = upperText.includes("FD");
+          const hasFD = upperText.includes("FD");
           const hasLoan = upperText.includes("LOAN");
 
           if (!hasFD && !hasLoan) continue;   // skip unrelated messages
 
-          const product     = hasFD ? "FD" : "Loan";   // FD takes priority if both present
-          const from        = message.from;
-          const contact     = contacts.find((c) => c.wa_id === from);
-          const name        = contact?.profile?.name || "";
+          const product = hasFD ? "FD" : "Loan";   // FD takes priority if both present
+          const from = message.from;
+          const contact = contacts.find((c) => c.wa_id === from);
+          const name = contact?.profile?.name || "";
           const createdDate = new Date(message.timestamp * 1000).toISOString().split("T")[0]; // YYYY-MM-DD
-          const locale      = contact?.profile?.locale || "";
+          const locale = contact?.profile?.locale || "";
 
           console.log(`[INFO] Keyword matched | Phone: ${from} | Product: ${product} | Message: "${text}"`);
 
