@@ -1,408 +1,717 @@
 require("dotenv").config();
 
 const express = require("express");
-
 const axios = require("axios");
- 
+
 const app = express();
-
 app.use(express.json({ limit: "1mb" }));
- 
+
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN || "myWebhookToken123";
- 
+
 // ─── All credentials from .env ────────────────────────────────────────────────
-
 const SFMC = {
-
-  clientId:       process.env.SFMC_CLIENT_ID,
-
-  clientSecret:   process.env.SFMC_CLIENT_SECRET,
-
-  authUrl:        `https://${process.env.SFMC_SUBDOMAIN}.auth.marketingcloudapis.com/v2/token`,
-
-  restUrl:        `https://${process.env.SFMC_SUBDOMAIN}.rest.marketingcloudapis.com`,
-
-  deKey:          process.env.SFMC_DE_KEY       || "FD_Loan_DE",
-
+  clientId:        process.env.SFMC_CLIENT_ID,
+  clientSecret:    process.env.SFMC_CLIENT_SECRET,
+  authUrl:         `https://${process.env.SFMC_SUBDOMAIN}.auth.marketingcloudapis.com/v2/token`,
+  restUrl:         `https://${process.env.SFMC_SUBDOMAIN}.rest.marketingcloudapis.com`,
+  fdDeKey:         process.env.SFMC_FD_DE_KEY   || "FD_Loan_DE",
+  loanDeKey:       process.env.SFMC_LOAN_DE_KEY || "Loan_DE",
   journeyEventKey: process.env.EVENT_DEFINITION_KEY
-
 };
- 
+
 // ─── Startup validation ───────────────────────────────────────────────────────
-
 const REQUIRED_ENV = [
-
   "SFMC_CLIENT_ID",
-
   "SFMC_CLIENT_SECRET",
-
   "SFMC_SUBDOMAIN",
-
-  "SFMC_DE_KEY",
-
+  "SFMC_FD_DE_KEY",
+  "SFMC_LOAN_DE_KEY",
   "EVENT_DEFINITION_KEY"
-
 ];
- 
+
 REQUIRED_ENV.forEach((key) => {
-
   if (!process.env[key]) {
-
     console.error(`[FATAL] Missing required env variable: ${key}`);
-
     process.exit(1);
-
   }
-
 });
- 
+
 console.log("[INFO] ENV loaded successfully");
-
 console.log("[INFO] SFMC subdomain:", process.env.SFMC_SUBDOMAIN);
-
-console.log("[INFO] DE Key:", SFMC.deKey);
-
+console.log("[INFO] FD DE Key:",      SFMC.fdDeKey);
+console.log("[INFO] Loan DE Key:",    SFMC.loanDeKey);
 console.log("[INFO] Journey Event Key:", SFMC.journeyEventKey);
- 
+
 // ─── Token cache ──────────────────────────────────────────────────────────────
-
 let tokenCache = { value: null, expiresAt: null };
- 
+
 async function getSFMCToken() {
-
   const now = Date.now();
-
   if (tokenCache.value && now < tokenCache.expiresAt - 60000) return tokenCache.value;
- 
+
   const response = await axios.post(SFMC.authUrl, {
-
     grant_type:    "client_credentials",
-
     client_id:     SFMC.clientId,
-
     client_secret: SFMC.clientSecret
-
   });
- 
+
   tokenCache.value     = response.data.access_token;
-
   tokenCache.expiresAt = now + response.data.expires_in * 1000;
-
   console.log("[INFO] New SFMC token fetched, expires in:", response.data.expires_in, "seconds");
-
   return tokenCache.value;
-
 }
- 
-// ─── Save to FD_Loan_DE ───────────────────────────────────────────────────────
 
-async function saveToFDLoanDE({ name, mobileNo, product, createdDate, locale }) {
+// ─── Resolve DE key by product ────────────────────────────────────────────────
+function getDeKeyForProduct(product) {
+  const p = (product || "").toUpperCase();
+  if (p === "FD")   return SFMC.fdDeKey;
+  if (p === "LOAN") return SFMC.loanDeKey;
+  throw new Error(`Unknown product: "${product}". Expected "FD" or "Loan".`);
+}
 
+// ─── Detect products from message text ───────────────────────────────────────
+// Returns an array: ["FD"], ["Loan"], or ["FD", "Loan"]
+function detectProducts(text) {
+  const upper    = (text || "").toUpperCase();
+  const products = [];
+  if (upper.includes("FD"))   products.push("FD");
+  if (upper.includes("LOAN")) products.push("Loan");
+  return products;
+}
+
+// ─── Save to a specific DE ────────────────────────────────────────────────────
+async function saveToDE({ name, mobileNo, product, createdDate }) {
   try {
-
     const token = await getSFMCToken();
- 
+    const deKey = getDeKeyForProduct(product);
+
     const payload = [
-
       {
-
-        keys: { MobileNo: mobileNo, Product: product },
-
+        keys:   { MobileNo: mobileNo, Product: product },
         values: {
-
           Name:        name || "",
-
           CreatedDate: createdDate || "",
-
           Locale:      "IN",
-
           Mobile_No:   mobileNo ? `+${mobileNo.replace(/^\+/, "")}` : ""
-
         }
-
       }
-
     ];
- 
+
     const sfmcRes = await axios.post(
-
-      `${SFMC.restUrl}/hub/v1/dataevents/key:${SFMC.deKey}/rowset`,
-
+      `${SFMC.restUrl}/hub/v1/dataevents/key:${deKey}/rowset`,
       payload,
-
       { headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" } }
-
     );
- 
-    console.log(`[INFO] ✅ Saved to FD_Loan_DE | MobileNo: ${mobileNo} | Product: ${product}`);
 
+    console.log(`[INFO] ✅ Saved to ${deKey} | MobileNo: ${mobileNo} | Product: ${product}`);
     console.log("[DEBUG] DE HTTP status:", sfmcRes.status);
-
     console.log("[DEBUG] DE response:", JSON.stringify(sfmcRes.data, null, 2));
-
     return true;
- 
+
   } catch (err) {
-
     if (err.response?.status === 401) tokenCache = { value: null, expiresAt: null };
-
-    console.error("[ERROR] ❌ Failed to save to FD_Loan_DE");
-
+    console.error(`[ERROR] ❌ Failed to save to DE | Product: ${product}`);
     console.error("[ERROR] HTTP status:", err.response?.status);
-
     console.error("[ERROR] Response body:", JSON.stringify(err.response?.data, null, 2));
-
     console.error("[ERROR] Message:", err.message);
-
     return false;
-
   }
-
 }
- 
+
 // ─── Fire Journey Builder Entry Event ────────────────────────────────────────
-
-async function fireJourneyEvent({ name, mobileNo, product, locale }) {
-
+async function fireJourneyEvent({ name, mobileNo, product }) {
   try {
-
-    const token = await getSFMCToken();
- 
+    const token        = await getSFMCToken();
     const compositeKey = `${mobileNo}_${product}`;
- 
+
     const payload = {
-
-      ContactKey:           compositeKey,
-
-      EventDefinitionKey:   SFMC.journeyEventKey,
-
+      ContactKey:         compositeKey,
+      EventDefinitionKey: SFMC.journeyEventKey,
       Data: {
-
         MobileNo:  mobileNo,
-
         Name:      name || "",
-
         Product:   product || "",
-
         Mobile_No: mobileNo,
-
         Locale:    "IN"
-
       }
-
     };
- 
-    console.log("[DEBUG] Firing journey event with payload:", JSON.stringify(payload, null, 2));
 
+    console.log("[DEBUG] Firing journey event:", JSON.stringify(payload, null, 2));
     console.log("[DEBUG] Posting to:", `${SFMC.restUrl}/interaction/v1/events`);
- 
+
     const sfmcRes = await axios.post(
-
       `${SFMC.restUrl}/interaction/v1/events`,
-
       payload,
-
       {
-
         headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-
         validateStatus: null
-
       }
-
     );
- 
+
     console.log("[DEBUG] Journey HTTP status:", sfmcRes.status);
-
     console.log("[DEBUG] Journey response:", JSON.stringify(sfmcRes.data, null, 2));
- 
+
     if (sfmcRes.status === 201) {
-
       console.log(`[INFO] ✅ Journey event fired | MobileNo: ${mobileNo} | Product: ${product}`);
-
       return true;
-
     } else {
-
-      console.error(`[ERROR] ❌ Journey event failed | HTTP ${sfmcRes.status} | MobileNo: ${mobileNo}`);
-
+      console.error(`[ERROR] ❌ Journey event failed | HTTP ${sfmcRes.status} | MobileNo: ${mobileNo} | Product: ${product}`);
       return false;
-
     }
- 
+
   } catch (err) {
-
     if (err.response?.status === 401) tokenCache = { value: null, expiresAt: null };
-
-    console.error("[ERROR] ❌ Journey event threw an exception:", err.message);
-
+    console.error("[ERROR] ❌ Journey event exception:", err.message);
     return false;
-
   }
-
 }
- 
+
+// ─── Process a single product: save DE + fire journey ────────────────────────
+async function processProduct({ name, mobileNo, product, createdDate }) {
+  console.log(`\n---------- Processing product: ${product} ----------`);
+  console.log(`[INFO] Target DE: ${getDeKeyForProduct(product)}`);
+
+  const saved = await saveToDE({ name, mobileNo, product, createdDate });
+
+  if (saved) {
+    await fireJourneyEvent({ name, mobileNo, product });
+  } else {
+    console.warn(`[WARN] Skipping journey event — DE save failed | MobileNo: ${mobileNo} | Product: ${product}`);
+  }
+
+  return saved;
+}
+
 // ─── Test endpoint ────────────────────────────────────────────────────────────
-
 app.post("/test-journey", async (req, res) => {
-
   const { mobileNo, name, product, locale } = req.body;
- 
+
   if (!mobileNo || !product) {
-
     return res.status(400).json({ error: "mobileNo and product are required" });
-
   }
- 
+
+  // Support comma-separated products: "FD,Loan" or single "FD" / "Loan"
+  const requestedProducts = product
+    .split(",")
+    .map((p) => p.trim())
+    .filter(Boolean);
+
+  // Validate all products before doing any work
+  for (const p of requestedProducts) {
+    try {
+      getDeKeyForProduct(p);
+    } catch (e) {
+      return res.status(400).json({ error: e.message });
+    }
+  }
+
   console.log("\n========== /test-journey ==========");
+  console.log("Input:", { mobileNo, name, products: requestedProducts });
 
-  console.log("Input:", { mobileNo, name, product, locale });
- 
-  const deResult = await saveToFDLoanDE({
+  const createdDate = new Date().toISOString().split("T")[0];
+  const results     = {};
 
-    mobileNo,
+  for (const p of requestedProducts) {
+    const saved = await saveToDE({
+      mobileNo,
+      name:        name || "Test User",
+      product:     p,
+      createdDate
+    });
 
-    name:        name || "Test User",
+    const journeyFired = saved
+      ? await fireJourneyEvent({ mobileNo, name: name || "Test User", product: p })
+      : false;
 
-    product,
+    results[p] = {
+      de:      getDeKeyForProduct(p),
+      saved:   saved        ? "✅ saved"  : "❌ failed",
+      journey: journeyFired ? "✅ fired"  : "❌ failed"
+    };
+  }
 
-    createdDate: new Date().toISOString().split("T")[0],
-
-    locale:      locale || "IN"
-
-  });
- 
-  const journeyResult = await fireJourneyEvent({
-
-    mobileNo,
-
-    name:    name || "Test User",
-
-    product,
-
-    locale:  "IN"
-
-  });
- 
-  return res.status(200).json({
-
-    deResult:      deResult      ? "✅ saved" : "❌ failed",
-
-    journeyResult: journeyResult ? "✅ fired" : "❌ failed"
-
-  });
-
+  return res.status(200).json({ results });
 });
- 
+
 // ─── Webhook verify (GET) ─────────────────────────────────────────────────────
-
 app.get("/webhook", (req, res) => {
-
   const mode      = req.query["hub.mode"];
-
   const token     = req.query["hub.verify_token"];
-
   const challenge = req.query["hub.challenge"];
- 
+
   if (mode === "subscribe" && token === VERIFY_TOKEN) {
-
     console.log("[INFO] Webhook verified");
-
     return res.status(200).send(challenge);
-
   }
-
   return res.sendStatus(403);
-
 });
- 
+
 // ─── Webhook POST ─────────────────────────────────────────────────────────────
-
 app.post("/webhook", async (req, res) => {
-
   const body = req.body;
- 
+
   if (body.object !== "whatsapp_business_account") {
-
     return res.status(404).json({ status: "error", message: "Not a whatsapp_business_account event" });
-
   }
- 
+
   try {
-
     for (const entry of body.entry || []) {
-
       for (const change of entry.changes || []) {
+        const messages = change.value?.messages || [];
+        const contacts = change.value?.contacts || [];
 
-        const messages = change.value?.messages  || [];
-
-        const contacts = change.value?.contacts  || [];
- 
         for (const message of messages) {
-
           if (message.type !== "text") continue;
- 
-          const text      = message.text?.body || "";
 
-          const upperText = text.toUpperCase();
+          const text     = message.text?.body || "";
+          const products = detectProducts(text);
 
-          const hasFD     = upperText.includes("FD");
-
-          const hasLoan   = upperText.includes("LOAN");
- 
-          if (!hasFD && !hasLoan) continue;
- 
-          const product     = hasFD ? "FD" : "Loan";
+          if (products.length === 0) continue;   // no relevant keyword found
 
           const mobileNo    = message.from;
-
           const contact     = contacts.find((c) => c.wa_id === mobileNo);
-
-          const name        = contact?.profile?.name   || "";
-
+          const name        = contact?.profile?.name || "";
           const createdDate = new Date(message.timestamp * 1000).toISOString().split("T")[0];
 
-          const locale      = "IN";
- 
           console.log(`\n========== Incoming message ==========`);
+          console.log(`MobileNo: ${mobileNo} | Message: "${text}"`);
+          console.log(`Detected products: [${products.join(", ")}]`);
+          console.log(`Contact found: ${contact ? "YES" : "NO — name will be empty"}`);
 
-          console.log(`MobileNo: ${mobileNo} | Product: ${product} | Message: "${text}"`);
-
-          console.log(`Contact found: ${contact ? "YES" : "NO — name/locale will be empty"}`);
- 
-          const saved = await saveToFDLoanDE({ name, mobileNo, product, createdDate, locale });
- 
-          if (saved) {
-
-            await fireJourneyEvent({ name, mobileNo, product, locale });
-
-          } else {
-
-            console.warn(`[WARN] Skipping journey event — DE save failed | MobileNo: ${mobileNo}`);
-
+          // Process each detected product independently
+          for (const product of products) {
+            await processProduct({ name, mobileNo, product, createdDate });
           }
-
         }
-
       }
-
     }
-
   } catch (err) {
-
     console.error("[ERROR] Webhook processing failed:", err.message);
-
     return res.status(500).json({ status: "error", message: err.message });
-
   }
- 
+
   return res.status(200).json({ status: "ok" });
-
 });
- 
-const PORT = process.env.PORT || 3000;
 
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`[INFO] Server running on port ${PORT}`));
+
+
+
+
+
+
+
+
+
+
+
+
+// require("dotenv").config();
+
+// const express = require("express");
+
+// const axios = require("axios");
+ 
+// const app = express();
+
+// app.use(express.json({ limit: "1mb" }));
+ 
+// const VERIFY_TOKEN = process.env.VERIFY_TOKEN || "myWebhookToken123";
+ 
+// // ─── All credentials from .env ────────────────────────────────────────────────
+
+// const SFMC = {
+
+//   clientId:       process.env.SFMC_CLIENT_ID,
+
+//   clientSecret:   process.env.SFMC_CLIENT_SECRET,
+
+//   authUrl:        `https://${process.env.SFMC_SUBDOMAIN}.auth.marketingcloudapis.com/v2/token`,
+
+//   restUrl:        `https://${process.env.SFMC_SUBDOMAIN}.rest.marketingcloudapis.com`,
+
+//   deKey:          process.env.SFMC_DE_KEY       || "FD_Loan_DE",
+
+//   journeyEventKey: process.env.EVENT_DEFINITION_KEY
+
+// };
+ 
+// // ─── Startup validation ───────────────────────────────────────────────────────
+
+// const REQUIRED_ENV = [
+
+//   "SFMC_CLIENT_ID",
+
+//   "SFMC_CLIENT_SECRET",
+
+//   "SFMC_SUBDOMAIN",
+
+//   "SFMC_DE_KEY",
+
+//   "EVENT_DEFINITION_KEY"
+
+// ];
+ 
+// REQUIRED_ENV.forEach((key) => {
+
+//   if (!process.env[key]) {
+
+//     console.error(`[FATAL] Missing required env variable: ${key}`);
+
+//     process.exit(1);
+
+//   }
+
+// });
+ 
+// console.log("[INFO] ENV loaded successfully");
+
+// console.log("[INFO] SFMC subdomain:", process.env.SFMC_SUBDOMAIN);
+
+// console.log("[INFO] DE Key:", SFMC.deKey);
+
+// console.log("[INFO] Journey Event Key:", SFMC.journeyEventKey);
+ 
+// // ─── Token cache ──────────────────────────────────────────────────────────────
+
+// let tokenCache = { value: null, expiresAt: null };
+ 
+// async function getSFMCToken() {
+
+//   const now = Date.now();
+
+//   if (tokenCache.value && now < tokenCache.expiresAt - 60000) return tokenCache.value;
+ 
+//   const response = await axios.post(SFMC.authUrl, {
+
+//     grant_type:    "client_credentials",
+
+//     client_id:     SFMC.clientId,
+
+//     client_secret: SFMC.clientSecret
+
+//   });
+ 
+//   tokenCache.value     = response.data.access_token;
+
+//   tokenCache.expiresAt = now + response.data.expires_in * 1000;
+
+//   console.log("[INFO] New SFMC token fetched, expires in:", response.data.expires_in, "seconds");
+
+//   return tokenCache.value;
+
+// }
+ 
+// // ─── Save to FD_Loan_DE ───────────────────────────────────────────────────────
+
+// async function saveToFDLoanDE({ name, mobileNo, product, createdDate, locale }) {
+
+//   try {
+
+//     const token = await getSFMCToken();
+ 
+//     const payload = [
+
+//       {
+
+//         keys: { MobileNo: mobileNo, Product: product },
+
+//         values: {
+
+//           Name:        name || "",
+
+//           CreatedDate: createdDate || "",
+
+//           Locale:      "IN",
+
+//           Mobile_No:   mobileNo ? `+${mobileNo.replace(/^\+/, "")}` : ""
+
+//         }
+
+//       }
+
+//     ];
+ 
+//     const sfmcRes = await axios.post(
+
+//       `${SFMC.restUrl}/hub/v1/dataevents/key:${SFMC.deKey}/rowset`,
+
+//       payload,
+
+//       { headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" } }
+
+//     );
+ 
+//     console.log(`[INFO] ✅ Saved to FD_Loan_DE | MobileNo: ${mobileNo} | Product: ${product}`);
+
+//     console.log("[DEBUG] DE HTTP status:", sfmcRes.status);
+
+//     console.log("[DEBUG] DE response:", JSON.stringify(sfmcRes.data, null, 2));
+
+//     return true;
+ 
+//   } catch (err) {
+
+//     if (err.response?.status === 401) tokenCache = { value: null, expiresAt: null };
+
+//     console.error("[ERROR] ❌ Failed to save to FD_Loan_DE");
+
+//     console.error("[ERROR] HTTP status:", err.response?.status);
+
+//     console.error("[ERROR] Response body:", JSON.stringify(err.response?.data, null, 2));
+
+//     console.error("[ERROR] Message:", err.message);
+
+//     return false;
+
+//   }
+
+// }
+ 
+// // ─── Fire Journey Builder Entry Event ────────────────────────────────────────
+
+// async function fireJourneyEvent({ name, mobileNo, product, locale }) {
+
+//   try {
+
+//     const token = await getSFMCToken();
+ 
+//     const compositeKey = `${mobileNo}_${product}`;
+ 
+//     const payload = {
+
+//       ContactKey:           compositeKey,
+
+//       EventDefinitionKey:   SFMC.journeyEventKey,
+
+//       Data: {
+
+//         MobileNo:  mobileNo,
+
+//         Name:      name || "",
+
+//         Product:   product || "",
+
+//         Mobile_No: mobileNo,
+
+//         Locale:    "IN"
+
+//       }
+
+//     };
+ 
+//     console.log("[DEBUG] Firing journey event with payload:", JSON.stringify(payload, null, 2));
+
+//     console.log("[DEBUG] Posting to:", `${SFMC.restUrl}/interaction/v1/events`);
+ 
+//     const sfmcRes = await axios.post(
+
+//       `${SFMC.restUrl}/interaction/v1/events`,
+
+//       payload,
+
+//       {
+
+//         headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+
+//         validateStatus: null
+
+//       }
+
+//     );
+ 
+//     console.log("[DEBUG] Journey HTTP status:", sfmcRes.status);
+
+//     console.log("[DEBUG] Journey response:", JSON.stringify(sfmcRes.data, null, 2));
+ 
+//     if (sfmcRes.status === 201) {
+
+//       console.log(`[INFO] ✅ Journey event fired | MobileNo: ${mobileNo} | Product: ${product}`);
+
+//       return true;
+
+//     } else {
+
+//       console.error(`[ERROR] ❌ Journey event failed | HTTP ${sfmcRes.status} | MobileNo: ${mobileNo}`);
+
+//       return false;
+
+//     }
+ 
+//   } catch (err) {
+
+//     if (err.response?.status === 401) tokenCache = { value: null, expiresAt: null };
+
+//     console.error("[ERROR] ❌ Journey event threw an exception:", err.message);
+
+//     return false;
+
+//   }
+
+// }
+ 
+// // ─── Test endpoint ────────────────────────────────────────────────────────────
+
+// app.post("/test-journey", async (req, res) => {
+
+//   const { mobileNo, name, product, locale } = req.body;
+ 
+//   if (!mobileNo || !product) {
+
+//     return res.status(400).json({ error: "mobileNo and product are required" });
+
+//   }
+ 
+//   console.log("\n========== /test-journey ==========");
+
+//   console.log("Input:", { mobileNo, name, product, locale });
+ 
+//   const deResult = await saveToFDLoanDE({
+
+//     mobileNo,
+
+//     name:        name || "Test User",
+
+//     product,
+
+//     createdDate: new Date().toISOString().split("T")[0],
+
+//     locale:      locale || "IN"
+
+//   });
+ 
+//   const journeyResult = await fireJourneyEvent({
+
+//     mobileNo,
+
+//     name:    name || "Test User",
+
+//     product,
+
+//     locale:  "IN"
+
+//   });
+ 
+//   return res.status(200).json({
+
+//     deResult:      deResult      ? "✅ saved" : "❌ failed",
+
+//     journeyResult: journeyResult ? "✅ fired" : "❌ failed"
+
+//   });
+
+// });
+ 
+// // ─── Webhook verify (GET) ─────────────────────────────────────────────────────
+
+// app.get("/webhook", (req, res) => {
+
+//   const mode      = req.query["hub.mode"];
+
+//   const token     = req.query["hub.verify_token"];
+
+//   const challenge = req.query["hub.challenge"];
+ 
+//   if (mode === "subscribe" && token === VERIFY_TOKEN) {
+
+//     console.log("[INFO] Webhook verified");
+
+//     return res.status(200).send(challenge);
+
+//   }
+
+//   return res.sendStatus(403);
+
+// });
+ 
+// // ─── Webhook POST ─────────────────────────────────────────────────────────────
+
+// app.post("/webhook", async (req, res) => {
+
+//   const body = req.body;
+ 
+//   if (body.object !== "whatsapp_business_account") {
+
+//     return res.status(404).json({ status: "error", message: "Not a whatsapp_business_account event" });
+
+//   }
+ 
+//   try {
+
+//     for (const entry of body.entry || []) {
+
+//       for (const change of entry.changes || []) {
+
+//         const messages = change.value?.messages  || [];
+
+//         const contacts = change.value?.contacts  || [];
+ 
+//         for (const message of messages) {
+
+//           if (message.type !== "text") continue;
+ 
+//           const text      = message.text?.body || "";
+
+//           const upperText = text.toUpperCase();
+
+//           const hasFD     = upperText.includes("FD");
+
+//           const hasLoan   = upperText.includes("LOAN");
+ 
+//           if (!hasFD && !hasLoan) continue;
+ 
+//           const product     = hasFD ? "FD" : "Loan";
+
+//           const mobileNo    = message.from;
+
+//           const contact     = contacts.find((c) => c.wa_id === mobileNo);
+
+//           const name        = contact?.profile?.name   || "";
+
+//           const createdDate = new Date(message.timestamp * 1000).toISOString().split("T")[0];
+
+//           const locale      = "IN";
+ 
+//           console.log(`\n========== Incoming message ==========`);
+
+//           console.log(`MobileNo: ${mobileNo} | Product: ${product} | Message: "${text}"`);
+
+//           console.log(`Contact found: ${contact ? "YES" : "NO — name/locale will be empty"}`);
+ 
+//           const saved = await saveToFDLoanDE({ name, mobileNo, product, createdDate, locale });
+ 
+//           if (saved) {
+
+//             await fireJourneyEvent({ name, mobileNo, product, locale });
+
+//           } else {
+
+//             console.warn(`[WARN] Skipping journey event — DE save failed | MobileNo: ${mobileNo}`);
+
+//           }
+
+//         }
+
+//       }
+
+//     }
+
+//   } catch (err) {
+
+//     console.error("[ERROR] Webhook processing failed:", err.message);
+
+//     return res.status(500).json({ status: "error", message: err.message });
+
+//   }
+ 
+//   return res.status(200).json({ status: "ok" });
+
+// });
+ 
+// const PORT = process.env.PORT || 3000;
+
+// app.listen(PORT, () => console.log(`[INFO] Server running on port ${PORT}`));
 
 
 
